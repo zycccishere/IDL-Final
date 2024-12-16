@@ -627,7 +627,7 @@ def test_model(model_path, test_loader, device, output_dir='visualization_result
     
     # 加载最佳模型
     checkpoint = torch.load(model_path, map_location=device)
-    model = YOLONAS_L(num_boxes=boxes)
+    model = YOLOLikeCNN(num_boxes=boxes)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
