@@ -14,6 +14,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from torchvision import transforms
 import torch.nn.functional as F
+from torchvision.ops import nms
 
 class CustomDataset(Dataset):
     def __init__(self, img_dir, label_dir, img_size=416):
@@ -194,6 +195,125 @@ class ConvBlock(nn.Module):
         x = self.bn(x)
         x = self.relu(x)
         return x
+
+class YOLOLikeCNN(nn.Module):
+    def __init__(self, num_boxes=5, nms_threshold=0.3):
+        super(YOLOLikeCNN, self).__init__()
+        self.num_boxes = num_boxes
+        self.nms_threshold = nms_threshold
+        
+        # Initial convolutional layer
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        # ResNet layers with additional convolutions
+        self.layer1 = self._make_layer(64, 64, 2)
+        self.layer1_extra = self._make_layer(64 * BasicBlock.expansion, 64, 1)
+        self.layer2 = self._make_layer(64, 128, 2, stride=2)
+        self.layer2_extra = self._make_layer(128 * BasicBlock.expansion, 128, 1)
+        self.layer3 = self._make_layer(128, 256, 2, stride=2)
+        self.layer3_extra = self._make_layer(256 * BasicBlock.expansion, 256, 1)
+        self.layer4 = self._make_layer(256, 512, 2, stride=2)
+        self.layer4_extra = self._make_layer(512 * BasicBlock.expansion, 512, 1)
+        
+        self.dropout = nn.Dropout(0.5)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(512 * BasicBlock.expansion, 512)
+        self.fc2 = nn.Linear(512, num_boxes * 5)
+
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or in_channels != out_channels * BasicBlock.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels * BasicBlock.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * BasicBlock.expansion),
+            )
+
+        layers = []
+        layers.append(BasicBlock(in_channels, out_channels, stride, downsample))
+        in_channels = out_channels * BasicBlock.expansion
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(in_channels, out_channels))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer1_extra(x)
+        x = self.layer2(x)
+        x = self.layer2_extra(x)
+        x = self.layer3(x)
+        x = self.layer3_extra(x)
+        x = self.layer4(x)
+        x = self.layer4_extra(x)
+        
+        x = self.global_avg_pool(x)
+        x = x.view(x.size(0), -1)
+        
+        x = self.dropout(F.relu(self.fc1(x)))
+        x = self.fc2(x)
+
+        # 调整输出形状为 (batch_size, num_boxes, 5) 格式
+        predictions = x.view(-1, self.num_boxes, 5)  # 每个框包含 [x, y, w, h, confidence]
+
+        # 使用NMS去除重复框
+        final_boxes, final_scores, final_classes = self._apply_nms(predictions)
+        
+        return final_boxes, final_scores, final_classes
+
+    def _apply_nms(self, predictions):
+        """
+        Apply Non-Maximum Suppression (NMS) to the predicted boxes and class scores.
+        
+        predictions: Tensor of shape (batch_size, num_boxes, 5) 
+                     where each box is represented as [x_center, y_center, width, height, confidence_score]
+        """
+        final_boxes = []
+        final_scores = []
+        final_classes = []
+
+        for i in range(predictions.size(0)):
+            boxes = predictions[i, :, :4]  # (num_boxes, 4) -> x_center, y_center, width, height
+            scores = predictions[i, :, 4]  # (num_boxes) -> confidence score
+
+            # 计算IoU的NMS操作需要先转换框的格式
+            boxes = self._convert_to_xyxy(boxes)  # 转换为 (x1, y1, x2, y2) 格式
+            
+            # NMS操作，返回选择的框、分数和类别（这里只考虑了一个类的情况）
+            keep = nms(boxes, scores, self.nms_threshold)
+            
+            final_boxes.append(boxes[keep])
+            final_scores.append(scores[keep])
+            final_classes.append(torch.zeros_like(scores[keep]))  # 假设所有框属于同一类（类别0）
+        
+        # 将每个batch的结果拼接起来
+        final_boxes = torch.stack(final_boxes, dim=0)
+        final_scores = torch.stack(final_scores, dim=0)
+        final_classes = torch.stack(final_classes, dim=0)
+        
+        return final_boxes, final_scores, final_classes
+
+    def _convert_to_xyxy(self, boxes):
+        """
+        Convert boxes from center-based format [x_center, y_center, width, height]
+        to corner-based format [x1, y1, x2, y2]
+        """
+        x_center, y_center, width, height = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = x_center - width / 2
+        y1 = y_center - height / 2
+        x2 = x_center + width / 2
+        y2 = y_center + height / 2
+        return torch.stack([x1, y1, x2, y2], dim=1)  # 返回(x1, y1, x2, y2)
     
 class YOLONAS_L(nn.Module):
     def __init__(self, num_classes=80, num_boxes=5):
@@ -274,74 +394,6 @@ class YOLONAS_L(nn.Module):
         x = self.head(x)
 
         return x.view(-1, self.num_boxes, 5)  # Reshape to (batch_size, num_boxes, 5)
-
-class YOLOLikeCNN(nn.Module):
-    def __init__(self, num_boxes=5):
-        super(YOLOLikeCNN, self).__init__()
-        self.num_boxes = num_boxes
-        
-        # Initial convolutional layer
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        
-        # ResNet layers with additional convolutions
-        self.layer1 = self._make_layer(64, 64, 2)
-        self.layer1_extra = self._make_layer(64 * BasicBlock.expansion, 64, 1)
-        self.layer2 = self._make_layer(64, 128, 2, stride=2)
-        self.layer2_extra = self._make_layer(128 * BasicBlock.expansion, 128, 1)
-        self.layer3 = self._make_layer(128, 256, 2, stride=2)
-        self.layer3_extra = self._make_layer(256 * BasicBlock.expansion, 256, 1)
-        self.layer4 = self._make_layer(256, 512, 2, stride=2)
-        self.layer4_extra = self._make_layer(512 * BasicBlock.expansion, 512, 1)
-        
-        self.dropout = nn.Dropout(0.5)
-        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(512 * BasicBlock.expansion, 512)
-        self.fc2 = nn.Linear(512, num_boxes * 5)
-
-    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
-        downsample = None
-        if stride != 1 or in_channels != out_channels * BasicBlock.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels * BasicBlock.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels * BasicBlock.expansion),
-            )
-
-        layers = []
-        layers.append(BasicBlock(in_channels, out_channels, stride, downsample))
-        in_channels = out_channels * BasicBlock.expansion
-        for _ in range(1, blocks):
-            layers.append(BasicBlock(in_channels, out_channels))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer1_extra(x)
-        x = self.layer2(x)
-        x = self.layer2_extra(x)
-        x = self.layer3(x)
-        x = self.layer3_extra(x)
-        x = self.layer4(x)
-        x = self.layer4_extra(x)
-        
-        x = self.global_avg_pool(x)
-        x = x.view(x.size(0), -1)
-        
-        x = self.dropout(F.relu(self.fc1(x)))
-        x = self.fc2(x)
-        
-        return x.view(-1, self.num_boxes, 5)
 
 # 计算IoU
 def calculate_box_iou(box1, box2):
@@ -575,7 +627,7 @@ def test_model(model_path, test_loader, device, output_dir='visualization_result
     
     # 加载最佳模型
     checkpoint = torch.load(model_path, map_location=device)
-    model = YOLONAS_L(num_boxes=boxes)
+    model = YOLOLikeCNN(num_boxes=boxes)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
@@ -731,9 +783,9 @@ def run(e=1,boxes=5):
     print(f"Using device: {device}")
 
     # Create datasets and data loaders
-    train_dataset = CustomDataset("data/train/images", "data/train/labels")
-    valid_dataset = CustomDataset("data/valid/images", "data/valid/labels")
-    test_dataset = CustomDataset("data/test/images", "data/test/labels")
+    train_dataset = CustomDataset("./data/train/images", "./data/train/labels")
+    valid_dataset = CustomDataset("./data/valid/images", "./data/valid/labels")
+    test_dataset = CustomDataset("./data/test/images", "./data/test/labels")
 
     train_loader = DataLoader(
         train_dataset,
@@ -776,7 +828,7 @@ def run(e=1,boxes=5):
     )
 
     # Test model
-    test_results = test_model("best_model.pth", test_loader, device,boxes=boxes)
+    # test_results = test_model("best_model.pth", test_loader, device,boxes=boxes)
 
     # Plot training history
     try:
