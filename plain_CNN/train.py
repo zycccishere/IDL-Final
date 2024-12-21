@@ -1,4 +1,5 @@
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3' 
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -667,7 +668,7 @@ def run(e=1,boxes=5):
     # Initialize model, criterion, and optimizer
     model = YOLOLikeCNN(num_boxes=boxes).to(device)
     criterion = YOLOLikeLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0003)
+    optimizer = optim.Adam(model.parameters(), lr=0.003)
 
     # Train model
     history = train_model(
@@ -736,5 +737,5 @@ def test(device='cuda',num=1):
 
 
 if __name__ == "__main__":
-    #run(e=100,boxes=1)
+    run(e=10,boxes=1)
     test(num=1)
