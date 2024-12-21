@@ -1,0 +1,6 @@
+data/
+dataset/
+*.png
+*.rar
+.DS_Store
+*.pth
